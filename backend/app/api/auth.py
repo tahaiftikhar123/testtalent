@@ -1,0 +1,47 @@
+from fastapi import APIRouter
+
+from app.schemas.auth import (
+    RegisterRequest,
+    VerifyEmailRequest,
+    ResendVerificationRequest,
+    LoginRequest,
+    RefreshRequest,
+    ForgotPasswordRequest,
+)
+from app.services.auth_service import AuthService
+
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+service = AuthService()
+
+
+@router.post("/register", status_code=201)
+async def register(request: RegisterRequest):
+    return await service.register(request)
+
+
+@router.post("/verify-email")
+async def verify_email(request: VerifyEmailRequest):
+    return await service.verify_email(request.access_token)
+
+
+# ----- US-003 -----
+@router.post("/resend-verification")
+async def resend_verification(request: ResendVerificationRequest):
+    return await service.resend_verification(request.email)
+
+
+# ----- US-004 / US-005 -----
+@router.post("/login")
+async def login(request: LoginRequest):
+    return await service.login(request)
+
+
+@router.post("/refresh")
+async def refresh(request: RefreshRequest):
+    return await service.refresh_token(request.refresh_token)
+
+
+# ----- US-006 -----
+@router.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    return await service.forgot_password(request.email)
