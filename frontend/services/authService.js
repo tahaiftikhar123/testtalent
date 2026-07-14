@@ -36,6 +36,11 @@ export async function login(payload) {
   return data;
 }
 
+export async function bootstrapSuperAdmin(payload) {
+  const { data } = await apiClient.post("/api/auth/bootstrap-super-admin", payload);
+  return data;
+}
+
 export async function refreshToken(refreshTokenValue) {
   const { data } = await apiClient.post("/api/auth/refresh", { refresh_token: refreshTokenValue });
   return data;

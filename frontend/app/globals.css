@@ -42,7 +42,17 @@ button, input { font: inherit; }
 .dashboard-card > p { color: var(--muted); margin-top: 0; }
 .invite-link-box { display: grid; gap: 12px; border: 1px solid var(--line); border-radius: 10px; padding: 14px; background: #f3f8fa; }
 .invite-link-box code { word-break: break-all; font-size: .85rem; color: var(--ink); }
+.dashboard-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.role-picker { border: 0; margin: 0; padding: 0; }
+.role-picker legend { margin-bottom: 10px; color: #29455e; font-size: .88rem; font-weight: 700; }
+.role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.role-option { display: grid; gap: 4px; border: 1px solid #bed0dc; border-radius: 10px; padding: 12px; cursor: pointer; background: white; }
+.role-option input { position: absolute; opacity: 0; pointer-events: none; }
+.role-option strong { color: var(--ink); font-size: .92rem; }
+.role-option span { color: var(--muted); font-size: .78rem; line-height: 1.4; }
+.role-option.selected { border-color: var(--blue); box-shadow: 0 0 0 3px rgb(23 104 150 / .13); background: #f3f8fb; }
 @media (max-width: 720px) {
   .form-grid, .onboarding-steps { grid-template-columns: 1fr; }
   .dashboard-header, .onboarding-header { flex-direction: column; align-items: flex-start; }
+  .role-grid { grid-template-columns: 1fr; }
 }

@@ -166,11 +166,12 @@ class CandidateService:
             return None
 
         if candidate["status"] == "active":
+            onboarding_status = (candidate.get("onboarding") or {}).get("status")
             return {
                 "message": "Your email has already been verified.",
                 "already_verified": True,
                 "role": "candidate",
-                "redirect_to": "/onboarding",
+                "redirect_to": "/dashboard/candidate" if onboarding_status == "submitted" else "/onboarding",
                 "user": self._public_user(candidate),
             }
 
@@ -287,6 +288,7 @@ class CandidateService:
                     "created_at": submitted_at,
                 }
             )
+            await self._ensure_employee_profile(candidate, submitted_at)
 
         await database.candidates.update_one({"_id": candidate["_id"]}, {"$set": updates})
         refreshed = await database.candidates.find_one({"_id": candidate["_id"]})
@@ -297,6 +299,27 @@ class CandidateService:
             "onboarding": refreshed.get("onboarding"),
             "candidate": self._public_user(refreshed),
         }
+
+    async def _ensure_employee_profile(self, candidate: dict, now: datetime) -> None:
+        """After onboarding, create an employee profile so they can sign in as Employee."""
+        existing = await database.employees.find_one({"supabase_user_id": candidate["supabase_user_id"]})
+        if existing:
+            return
+        await database.employees.insert_one(
+            {
+                "supabase_user_id": candidate["supabase_user_id"],
+                "full_name": candidate["full_name"],
+                "email": candidate["email"],
+                "phone": candidate.get("phone"),
+                "role": "employee",
+                "status": "active",
+                "job_title": candidate.get("job_title"),
+                "department": candidate.get("department"),
+                "candidate_id": candidate["supabase_user_id"],
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
 
     async def _require_active_candidate(self, access_token: str) -> dict:
         try:

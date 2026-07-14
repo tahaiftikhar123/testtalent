@@ -7,6 +7,7 @@ from app.schemas.auth import (
     LoginRequest,
     RefreshRequest,
     ForgotPasswordRequest,
+    BootstrapSuperAdminRequest,
 )
 from app.schemas.invitation import CandidateRegisterRequest
 from app.services.auth_service import AuthService
@@ -26,6 +27,12 @@ async def register(request: RegisterRequest):
 async def candidate_register(request: CandidateRegisterRequest):
     """US-010: Candidate registers via recruiter invitation link."""
     return await candidate_service.register(request)
+
+
+@router.post("/bootstrap-super-admin", status_code=201)
+async def bootstrap_super_admin(request: BootstrapSuperAdminRequest):
+    """Create the first super admin when none exists yet."""
+    return await service.bootstrap_super_admin(request)
 
 
 @router.post("/verify-email")

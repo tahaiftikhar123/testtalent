@@ -8,6 +8,7 @@ from app.core.database import database, supabase
 from app.schemas.auth import (
     LoginRequest,
     RegisterRequest,
+    BootstrapSuperAdminRequest,
 )
 
 
@@ -140,7 +141,94 @@ class AuthService:
         if candidate_result:
             return candidate_result
 
+        super_admin = await database.super_admins.find_one({"supabase_user_id": user.id})
+        if super_admin:
+            if super_admin["status"] == "active":
+                return {
+                    "message": "Your email has already been verified.",
+                    "already_verified": True,
+                    "role": "super_admin",
+                    "redirect_to": "/login",
+                }
+            verified_at = datetime.now(UTC)
+            await database.super_admins.update_one(
+                {"_id": super_admin["_id"], "status": "pending_verification"},
+                {"$set": {"status": "active", "email_verified_at": verified_at, "updated_at": verified_at}},
+            )
+            return {
+                "message": "Your email has been verified. Your super admin account is now active.",
+                "already_verified": False,
+                "role": "super_admin",
+                "redirect_to": "/login",
+            }
+
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account was not found.")
+
+    async def bootstrap_super_admin(self, request: BootstrapSuperAdminRequest) -> dict:
+        existing_count = await database.super_admins.count_documents({})
+        if existing_count > 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A super admin already exists. Sign in with the Super Admin role.",
+            )
+
+        try:
+            response = await run_in_threadpool(
+                supabase.auth.sign_up,
+                {
+                    "email": request.email,
+                    "password": request.password,
+                    "options": {
+                        "data": {
+                            "full_name": request.full_name,
+                            "phone": request.phone,
+                            "role": "super_admin",
+                        },
+                        "email_redirect_to": settings.verification_redirect_url,
+                    },
+                },
+            )
+        except Exception as error:
+            message = str(error).lower()
+            if "rate limit" in message:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Email sending is temporarily rate-limited by Supabase. Wait a few minutes, then try again.",
+                ) from error
+            if "already" in message or "registered" in message or "duplicate" in message:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account already exists for this email address.",
+                ) from error
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="We could not create the super admin account. Please try again.",
+            ) from error
+
+        if not response.user or response.user.identities == []:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account already exists for this email address.",
+            )
+
+        now = datetime.now(UTC)
+        await database.super_admins.insert_one(
+            {
+                "supabase_user_id": response.user.id,
+                "full_name": request.full_name,
+                "email": request.email,
+                "phone": request.phone,
+                "role": "super_admin",
+                "status": "pending_verification",
+                "email_verified_at": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return {
+            "message": "Super admin created. Check your inbox to verify your email, then sign in as Super Admin.",
+            "role": "super_admin",
+        }
 
     # ------------------------------------------------------------------
     # New methods for US-003 → US-006
@@ -208,11 +296,17 @@ class AuthService:
         )
         return {"message": "A new verification email has been sent. Please check your inbox."}
 
+    ROLE_REDIRECTS = {
+        "recruiter": "/dashboard/recruiter",
+        "candidate": "/dashboard/candidate",
+        "employee": "/dashboard/employee",
+        "super_admin": "/dashboard/super-admin",
+    }
+
     async def login(self, request: LoginRequest) -> dict:
         """
-        Authenticate recruiter and return JWT tokens.
-        US-004: Recruiter securely logs in.
-        US-005: 'remember_me' flag influences token persistence (handled later by refresh flow).
+        Authenticate by selected role and route to the matching dashboard.
+        US-004: Secure login for recruiter (extended for candidate, employee, super_admin).
         """
         try:
             auth_response = await run_in_threadpool(
@@ -232,65 +326,64 @@ class AuthService:
                 detail="Please verify your email before logging in.",
             )
 
-        recruiter = await database.recruiters.find_one({"supabase_user_id": user.id})
-        if recruiter and recruiter["status"] == "active":
-            await self._create_audit_log(user.id, recruiter["email"], "recruiter_login", "success")
-            return {
-                "message": "Login successful.",
-                "user": {
-                    "id": recruiter["supabase_user_id"],
-                    "full_name": recruiter["full_name"],
-                    "email": recruiter["email"],
-                    "phone": recruiter["phone"],
-                    "role": recruiter["role"],
-                },
-                "session": {
-                    "access_token": auth_response.session.access_token,
-                    "refresh_token": auth_response.session.refresh_token,
-                    "expires_in": auth_response.session.expires_in,
-                    "token_type": auth_response.session.token_type,
-                },
-                "redirect_to": "/dashboard",
-            }
-
-        candidate = await database.candidates.find_one({"supabase_user_id": user.id})
-        if candidate and candidate["status"] == "active":
-            await database.audit_logs.insert_one(
-                {
-                    "candidate_id": user.id,
-                    "email": candidate["email"],
-                    "module": "authentication",
-                    "action": "candidate_login",
-                    "outcome": "success",
-                    "created_at": datetime.now(UTC),
-                }
+        profile = await self._resolve_role_profile(user.id, request.role)
+        if not profile:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"No active {request.role.replace('_', ' ')} account found for these credentials.",
             )
-            onboarding_status = (candidate.get("onboarding") or {}).get("status")
-            redirect_to = "/onboarding" if onboarding_status != "submitted" else "/onboarding"
-            return {
-                "message": "Login successful.",
-                "user": {
-                    "id": candidate["supabase_user_id"],
-                    "full_name": candidate["full_name"],
-                    "email": candidate["email"],
-                    "phone": candidate["phone"],
-                    "role": candidate["role"],
-                    "job_title": candidate.get("job_title"),
-                    "department": candidate.get("department"),
-                },
-                "session": {
-                    "access_token": auth_response.session.access_token,
-                    "refresh_token": auth_response.session.refresh_token,
-                    "expires_in": auth_response.session.expires_in,
-                    "token_type": auth_response.session.token_type,
-                },
-                "redirect_to": redirect_to,
-            }
 
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is not active. Please verify your email.",
+        redirect_to = self.ROLE_REDIRECTS[request.role]
+        if request.role == "candidate":
+            onboarding_status = (profile.get("onboarding") or {}).get("status")
+            if onboarding_status != "submitted":
+                redirect_to = "/onboarding"
+
+        await database.audit_logs.insert_one(
+            {
+                "user_id": user.id,
+                "email": profile["email"],
+                "module": "authentication",
+                "action": f"{request.role}_login",
+                "outcome": "success",
+                "created_at": datetime.now(UTC),
+            }
         )
+
+        return {
+            "message": "Login successful.",
+            "user": {
+                "id": profile["supabase_user_id"],
+                "full_name": profile["full_name"],
+                "email": profile["email"],
+                "phone": profile.get("phone"),
+                "role": request.role,
+                "job_title": profile.get("job_title"),
+                "department": profile.get("department"),
+            },
+            "session": {
+                "access_token": auth_response.session.access_token,
+                "refresh_token": auth_response.session.refresh_token,
+                "expires_in": auth_response.session.expires_in,
+                "token_type": auth_response.session.token_type,
+            },
+            "redirect_to": redirect_to,
+        }
+
+    async def _resolve_role_profile(self, supabase_user_id: str, role: str) -> dict | None:
+        collections = {
+            "recruiter": database.recruiters,
+            "candidate": database.candidates,
+            "employee": database.employees,
+            "super_admin": database.super_admins,
+        }
+        collection = collections.get(role)
+        if collection is None:
+            return None
+        profile = await collection.find_one({"supabase_user_id": supabase_user_id})
+        if not profile or profile.get("status") != "active":
+            return None
+        return profile
 
     async def refresh_token(self, refresh_token: str) -> dict:
         """

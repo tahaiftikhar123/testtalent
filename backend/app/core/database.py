@@ -23,3 +23,9 @@ async def create_database_indexes() -> None:
     await database.candidates.create_index("email", unique=True)
     await database.candidates.create_index("supabase_user_id", unique=True, sparse=True)
     await database.candidates.create_index("invitation_token", unique=True, sparse=True)
+
+    await database.employees.create_index("email", unique=True)
+    await database.employees.create_index("supabase_user_id", unique=True, sparse=True)
+
+    await database.super_admins.create_index("email", unique=True)
+    await database.super_admins.create_index("supabase_user_id", unique=True, sparse=True)

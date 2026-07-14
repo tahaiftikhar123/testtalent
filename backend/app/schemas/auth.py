@@ -1,4 +1,5 @@
 import re
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -69,6 +70,7 @@ class ResendVerificationRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    role: Literal["recruiter", "candidate", "employee", "super_admin"]
     remember_me: bool = False
 
 
@@ -78,3 +80,50 @@ class RefreshRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+
+
+class BootstrapSuperAdminRequest(BaseModel):
+    full_name: str = Field(min_length=2, max_length=100)
+    email: EmailStr
+    phone: str
+    password: str
+    confirm_password: str
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_full_name(cls, value: str) -> str:
+        normalized_value = " ".join(value.split())
+        if len(normalized_value) < 2:
+            raise ValueError("Full name must contain at least two characters.")
+        return normalized_value
+
+    @field_validator("email")
+    @classmethod
+    def validate_company_email(cls, value: EmailStr) -> str:
+        normalized_email = value.lower()
+        if not normalized_email.endswith("@gmail.com"):
+            raise ValueError("Use a valid @gmail.com email address.")
+        return normalized_email
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str) -> str:
+        normalized_value = value.strip()
+        if not PHONE_PATTERN.fullmatch(normalized_value):
+            raise ValueError("Enter a valid phone number.")
+        return normalized_value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if not PASSWORD_PATTERN.fullmatch(value):
+            raise ValueError(
+                "Password must be at least 8 characters and include uppercase, lowercase, number, and special character."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_passwords(self):
+        if self.password != self.confirm_password:
+            raise ValueError("Password confirmation does not match.")
+        return self

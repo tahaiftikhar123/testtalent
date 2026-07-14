@@ -7,8 +7,16 @@ import { useState } from "react";
 
 import { getApiErrorMessage, login } from "@/services/authService";
 
+const ROLES = [
+  { id: "recruiter", label: "Recruiter", hint: "Hiring & invitations" },
+  { id: "candidate", label: "Candidate", hint: "Offer & onboarding" },
+  { id: "employee", label: "Employee", hint: "Workplace portal" },
+  { id: "super_admin", label: "Super Admin", hint: "Platform control" },
+];
+
 export default function LoginPage() {
   const router = useRouter();
+  const [role, setRole] = useState("recruiter");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [rememberMe, setRememberMe] = useState(false);
@@ -26,19 +34,24 @@ export default function LoginPage() {
 
     setIsSubmitting(true);
     try {
-      const data = await login({ email: email.trim(), password, remember_me: rememberMe });
-      // Store session tokens in localStorage for persistence
+      const data = await login({
+        email: email.trim(),
+        password,
+        role,
+        remember_me: rememberMe,
+      });
       localStorage.setItem("access_token", data.session.access_token);
       localStorage.setItem("refresh_token", data.session.refresh_token);
       localStorage.setItem("user", JSON.stringify(data.user));
-
-      router.push(data.redirect_to || (data.user?.role === "candidate" ? "/onboarding" : "/dashboard"));
+      router.push(data.redirect_to);
     } catch (error) {
       setFormMessage(getApiErrorMessage(error, "Login failed. Please check your credentials."));
     } finally {
       setIsSubmitting(false);
     }
   }
+
+  const selected = ROLES.find((item) => item.id === role);
 
   return (
     <main className="auth-shell">
@@ -50,14 +63,36 @@ export default function LoginPage() {
         </div>
 
         <div className="auth-intro">
-          <p className="eyebrow">Recruiter access</p>
+          <p className="eyebrow">Secure access</p>
           <h1 id="login-heading">Sign in to Talent</h1>
-          <p>Enter your credentials to continue.</p>
+          <p>Choose your role, then enter your credentials to open that dashboard.</p>
         </div>
 
         <form className="auth-form" onSubmit={handleSubmit} noValidate>
+          <fieldset className="role-picker">
+            <legend>Sign in as</legend>
+            <div className="role-grid" role="radiogroup" aria-label="Account role">
+              {ROLES.map((item) => (
+                <label key={item.id} className={`role-option ${role === item.id ? "selected" : ""}`}>
+                  <input
+                    type="radio"
+                    name="role"
+                    value={item.id}
+                    checked={role === item.id}
+                    onChange={() => {
+                      setRole(item.id);
+                      setFormMessage("");
+                    }}
+                  />
+                  <strong>{item.label}</strong>
+                  <span>{item.hint}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
           <label className="field">
-            <span>Company email</span>
+            <span>Email</span>
             <input
               type="email"
               name="email"
@@ -102,7 +137,7 @@ export default function LoginPage() {
           {formMessage && <p className="form-message" role="status">{formMessage}</p>}
 
           <button className="primary-button" type="submit" disabled={isSubmitting}>
-            {isSubmitting ? "Signing in…" : "Sign in"}
+            {isSubmitting ? "Signing in…" : `Sign in as ${selected?.label}`}
           </button>
         </form>
 
@@ -111,7 +146,7 @@ export default function LoginPage() {
             <Link href="/forgot-password">Forgot password?</Link>
           </p>
           <p>
-            Don’t have an account? <Link href="/register">Create one</Link>
+            Recruiter account? <Link href="/register">Create one</Link>
           </p>
         </div>
       </section>
@@ -119,12 +154,12 @@ export default function LoginPage() {
       <aside className="auth-aside" aria-label="Talent platform introduction">
         <div>
           <p className="eyebrow">Mazik Global</p>
-          <h2>Your recruitment dashboard awaits.</h2>
-          <p>Access job postings, candidate pipelines, and onboarding tools securely.</p>
+          <h2>One platform. Four role-based workspaces.</h2>
+          <p>Recruiters, candidates, employees, and admins each land in the dashboard built for their work.</p>
         </div>
         <div className="aside-metric">
-          <strong>Secure login</strong>
-          <span>Persistent sessions with refresh tokens.</span>
+          <strong>Role-based access</strong>
+          <span>Your selected role must match your account to continue.</span>
         </div>
       </aside>
     </main>
