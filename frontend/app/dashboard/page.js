@@ -1,0 +1,28 @@
+"use client";
+
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+
+const ROLE_HOME = {
+  recruiter: "/dashboard/recruiter",
+  candidate: "/dashboard/candidate",
+  employee: "/dashboard/employee",
+  super_admin: "/dashboard/super-admin",
+};
+
+export default function DashboardIndexPage() {
+  const router = useRouter();
+
+  useEffect(() => {
+    const storedUser = localStorage.getItem("user");
+    const accessToken = localStorage.getItem("access_token");
+    if (!storedUser || !accessToken) {
+      router.replace("/login");
+      return;
+    }
+    const user = JSON.parse(storedUser);
+    router.replace(ROLE_HOME[user.role] || "/login");
+  }, [router]);
+
+  return <p style={{ textAlign: "center", marginTop: "2rem" }}>Opening your dashboard…</p>;
+}

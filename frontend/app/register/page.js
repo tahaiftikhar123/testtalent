@@ -57,6 +57,8 @@ export default function RegisterPage() {
     setIsSubmitting(true);
     try {
       const response = await register({ ...form, full_name: form.full_name.trim(), email: form.email.trim() });
+      // Store email so the verification page can offer a resend
+      sessionStorage.setItem("pendingEmail", form.email.trim());
       setFormMessage(response.message);
       router.push("/verify-email");
     } catch (error) {
@@ -101,7 +103,7 @@ export default function RegisterPage() {
           </button>
         </form>
 
-        <p className="auth-footer">Already have an account? <Link href="#">Sign in</Link></p>
+        <p className="auth-footer">Already have an account? <Link href="/login">Sign in</Link></p>
       </section>
 
       <aside className="auth-aside" aria-label="Talent platform introduction">
