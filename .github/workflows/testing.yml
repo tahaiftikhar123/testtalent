@@ -6,24 +6,29 @@ on:
       - main
 
 jobs:
-
   deploy:
-
     runs-on: self-hosted
 
     steps:
+      - uses: actions/checkout@v4
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Create Backend .env
+        shell: pwsh
+        run: |
+          @"
+          ${{ secrets.BACKEND_ENV }}
+          "@ | Out-File -FilePath backend/.env -Encoding utf8
+
+      - name: Verify .env
+        shell: pwsh
+        run: |
+          Get-Content backend/.env
 
       - name: Stop Containers
         run: docker compose down
 
-      - name: Build Containers
-        run: docker compose build
+      - name: Build & Start
+        run: docker compose up -d --build
 
-      - name: Start Containers
-        run: docker compose up -d
-
-      - name: Remove old images
+      - name: Cleanup Images
         run: docker image prune -f
