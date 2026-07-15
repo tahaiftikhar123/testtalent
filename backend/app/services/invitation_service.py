@@ -64,6 +64,22 @@ class InvitationService:
             }
         )
 
+        # Send invitation email
+        invite_link = settings.invitation_link(token)
+        expires_str = invitation["expires_at"].strftime("%B %d, %Y")
+        try:
+            from app.services.email_service import email_service
+            email_service.send_invitation_email(
+                to_email=request.email,
+                full_name=request.full_name,
+                job_title=request.job_title,
+                department=request.department,
+                invite_link=invite_link,
+                expires_at=expires_str,
+            )
+        except Exception:
+            pass  # Best-effort; token is already stored in DB
+
         return {
             "message": "Invitation created successfully.",
             "invitation": {

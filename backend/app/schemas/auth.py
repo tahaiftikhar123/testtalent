@@ -57,13 +57,32 @@ class RegisterRequest(BaseModel):
         return self
 
 
+# --- OTP Verification (signup) ---
+
+class VerifyOTPRequest(BaseModel):
+    """Verify signup OTP."""
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return value.lower().strip()
+
+
+# --- Kept for backward-compatibility with frontend that sends access_token ---
 class VerifyEmailRequest(BaseModel):
-    access_token: str = Field(min_length=1)
+    """Legacy: accepts either access_token (old) or {email, otp} (new)."""
+    access_token: str | None = None
+    email: EmailStr | None = None
+    otp: str | None = None
 
-
-# --- New models for US-003 to US-006 ---
 
 class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class ResendOTPRequest(BaseModel):
     email: EmailStr
 
 
@@ -83,10 +102,16 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    access_token: str = Field(min_length=1)
-    refresh_token: str = Field(min_length=1)
+    """OTP-based password reset."""
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
     password: str
     confirm_password: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return value.lower().strip()
 
     @field_validator("password")
     @classmethod
@@ -100,6 +125,28 @@ class ResetPasswordRequest(BaseModel):
     @model_validator(mode="after")
     def validate_passwords(self):
         if self.password != self.confirm_password:
+            raise ValueError("Password confirmation does not match.")
+        return self
+
+
+class ChangePasswordRequest(BaseModel):
+    """Authenticated user changes their own password."""
+    current_password: str
+    new_password: str
+    confirm_new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        if not PASSWORD_PATTERN.fullmatch(value):
+            raise ValueError(
+                "Password must be at least 8 characters and include uppercase, lowercase, number, and special character."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_passwords(self):
+        if self.new_password != self.confirm_new_password:
             raise ValueError("Password confirmation does not match.")
         return self
 

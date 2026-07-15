@@ -1,176 +1,270 @@
+"""MongoDB + JWT authentication service — replaces all Supabase Auth."""
+
+import random
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
+from jose import jwt
 from pymongo import ReturnDocument
-from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
-from app.core.database import database, supabase
+from app.core.database import database
 from app.core.rbac import CurrentUser
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    hash_password,
+    verify_password,
+)
 from app.schemas.auth import (
+    BootstrapSuperAdminRequest,
     LoginRequest,
     RegisterRequest,
-    BootstrapSuperAdminRequest,
 )
+from app.services.email_service import email_service
 
-# ----- US-004: account lockout after repeated failed sign-ins -----
+# ---------- Brute-force protection constants ----------
 LOCKOUT_THRESHOLD = 5
 LOCKOUT_DURATION_MINUTES = 15
 
 
+def _generate_otp() -> str:
+    """Generate a cryptographically random 6-digit OTP."""
+    return str(random.SystemRandom().randint(100000, 999999))
+
+
 class AuthService:
-    # ------------------------------------------------------------------
-    # Existing registration and verification (unchanged, kept for context)
-    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------ #
+    # SIGNUP — Recruiter                                                    #
+    # ------------------------------------------------------------------ #
 
     async def register(self, request: RegisterRequest) -> dict:
-        existing_recruiter = await database.recruiters.find_one({"email": request.email})
-        if existing_recruiter:
+        """
+        Step 1 of signup: store pending user + send OTP email.
+        Account is NOT active until OTP is verified.
+        """
+        email = request.email.lower().strip()
+
+        # Duplicate checks across all active collections
+        if await database.users.find_one({"email": email}):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this email address.",
             )
+        if await database.recruiters.find_one({"email": email}):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account already exists for this email address.",
+            )
+
+        otp = _generate_otp()
+        now = datetime.now(UTC)
+        otp_expires_at = now + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+        # pending entry expires after 30 minutes so MongoDB TTL can clean it up
+        pending_expires_at = now + timedelta(minutes=30)
+
+        await database.pending_users.replace_one(
+            {"email": email},
+            {
+                "email": email,
+                "full_name": request.full_name,
+                "phone": request.phone,
+                "password_hash": hash_password(request.password),
+                "role": "recruiter",
+                "otp": otp,
+                "otp_expires_at": otp_expires_at,
+                "expires_at": pending_expires_at,
+                "created_at": now,
+            },
+            upsert=True,
+        )
 
         try:
-            response = await run_in_threadpool(
-                supabase.auth.sign_up,
-                {
-                    "email": request.email,
-                    "password": request.password,
-                    "options": {
-                        "data": {"full_name": request.full_name, "phone": request.phone, "role": "recruiter"},
-                        "email_redirect_to": settings.verification_redirect_url,
-                    },
-                },
-            )
-        except Exception as error:
-            message = str(error).lower()
-            if "already" in message or "registered" in message or "duplicate" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="An account already exists for this email address.",
-                ) from error
-            if "rate limit" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Email sending is temporarily rate-limited by Supabase. Wait a few minutes, then try again (or use a different email).",
-                ) from error
+            email_service.send_signup_otp(email, request.full_name, otp)
+        except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="We could not create your account. Please try again.",
-            ) from error
+                detail="We could not send the verification email. Please try again.",
+            ) from exc
 
-        if not response.user:
+        return {
+            "message": "Registration successful. A 6-digit verification code has been sent to your email.",
+        }
+
+    # ------------------------------------------------------------------ #
+    # OTP VERIFICATION — Signup                                            #
+    # ------------------------------------------------------------------ #
+
+    async def verify_otp(self, email: str, otp: str) -> dict:
+        """
+        Step 2 of signup: verify the OTP, activate the account, and return JWT.
+        """
+        email = email.lower().strip()
+
+        pending = await database.pending_users.find_one({"email": email})
+        if not pending:
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="We could not create your account. Please try again.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No pending registration found for this email. Please register again.",
             )
 
-        if response.user.identities == []:
+        otp_expires_at = pending["otp_expires_at"]
+        if otp_expires_at.tzinfo is None:
+            otp_expires_at = otp_expires_at.replace(tzinfo=UTC)
+
+        if datetime.now(UTC) > otp_expires_at:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="An account already exists for this email address.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This verification code has expired. Please request a new one.",
+            )
+
+        if pending["otp"] != otp.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid verification code. Please try again.",
             )
 
         now = datetime.now(UTC)
-        recruiter = {
-            "supabase_user_id": response.user.id,
-            "full_name": request.full_name,
-            "email": request.email,
-            "phone": request.phone,
-            "role": "recruiter",
-            "status": "pending_verification",
-            "email_verified_at": None,
+        role = pending["role"]
+
+        # Create user credentials record
+        user_doc = {
+            "email": email,
+            "password_hash": pending["password_hash"],
+            "role": role,
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            result = await database.users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+        except Exception as exc:
+            if "duplicate key" in str(exc).lower():
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account already exists for this email address.",
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Account could not be created. Please contact support.",
+            ) from exc
+
+        # Create role-specific profile
+        profile_doc = {
+            "user_id": user_id,
+            "full_name": pending["full_name"],
+            "email": email,
+            "phone": pending.get("phone"),
+            "role": role,
+            "status": "active",
+            "email_verified_at": now,
             "created_at": now,
             "updated_at": now,
         }
 
-        try:
-            await database.recruiters.insert_one(recruiter)
-        except Exception as error:
-            if "duplicate key" in str(error).lower():
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="An account already exists for this email address.",
-                ) from error
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Your account could not be saved. Please contact support if this continues.",
-            ) from error
+        collection_map = {
+            "recruiter": database.recruiters,
+            "super_admin": database.super_admins,
+            "candidate": database.candidates,
+            "employee": database.employees,
+        }
+        collection = collection_map.get(role)
+        if collection is not None:
+            # Merge any extra data stored during registration
+            extra = pending.get("extra_data") or {}
+            profile_doc.update(extra)
+            await collection.insert_one(profile_doc)
 
-        await self._create_audit_log(response.user.id, request.email, "recruiter_registered", "success")
-        return {"message": "Registration successful. Check your inbox to verify your email address."}
+        # Remove the pending record
+        await database.pending_users.delete_one({"email": email})
 
-    async def verify_email(self, access_token: str) -> dict:
-        try:
-            response = await run_in_threadpool(supabase.auth.get_user, access_token)
-            user = response.user
-        except Exception as error:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your verification session is invalid or has expired.",
-            ) from error
+        # Audit log
+        await self._create_audit_log(user_id, email, f"{role}_email_verified", "success")
 
-        if not user or not user.email_confirmed_at:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Verify your email from the link in your inbox before continuing.",
-            )
-
-        recruiter = await database.recruiters.find_one({"supabase_user_id": user.id})
-        if recruiter:
-            if recruiter["status"] == "active":
-                return {
-                    "message": "Your email has already been verified.",
-                    "already_verified": True,
-                    "role": "recruiter",
-                    "redirect_to": "/login",
-                }
-
-            verified_at = datetime.now(UTC)
-            await database.recruiters.update_one(
-                {"_id": recruiter["_id"], "status": "pending_verification"},
-                {"$set": {"status": "active", "email_verified_at": verified_at, "updated_at": verified_at}},
-            )
-            await self._create_audit_log(user.id, recruiter["email"], "recruiter_email_verified", "success")
+        # For non-candidate roles: redirect to login (no auto-session)
+        if role != "candidate":
             return {
-                "message": "Your email has been verified. Your recruiter account is now active.",
+                "message": "Your email has been verified. Your account is now active.",
                 "already_verified": False,
-                "role": "recruiter",
+                "role": role,
                 "redirect_to": "/login",
             }
 
-        # US-010: candidate verification after invitation-based registration
-        from app.services.candidate_service import CandidateService
+        # For candidates: issue tokens so they can start onboarding immediately
+        access_token = create_access_token({"user_id": user_id, "email": email, "role": role})
+        refresh_token_str = create_refresh_token({"user_id": user_id, "email": email, "role": role})
+        await self._store_refresh_token(user_id, refresh_token_str)
 
-        candidate_result = await CandidateService().activate_from_token(access_token)
-        if candidate_result:
-            return candidate_result
+        return {
+            "message": "Your email has been verified. Continue to onboarding.",
+            "already_verified": False,
+            "role": role,
+            "redirect_to": "/onboarding",
+            "user": {
+                "id": user_id,
+                "full_name": pending["full_name"],
+                "email": email,
+                "phone": pending.get("phone"),
+                "role": role,
+            },
+            "session": {
+                "access_token": access_token,
+                "refresh_token": refresh_token_str,
+                "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
+                "token_type": "bearer",
+            },
+        }
 
-        super_admin = await database.super_admins.find_one({"supabase_user_id": user.id})
-        if super_admin:
-            if super_admin["status"] == "active":
-                return {
-                    "message": "Your email has already been verified.",
-                    "already_verified": True,
-                    "role": "super_admin",
-                    "redirect_to": "/login",
+    # ------------------------------------------------------------------ #
+    # RESEND OTP                                                           #
+    # ------------------------------------------------------------------ #
+
+    async def resend_otp(self, email: str) -> dict:
+        """Resend a fresh OTP to the pending user's email."""
+        email = email.lower().strip()
+
+        pending = await database.pending_users.find_one({"email": email})
+        if not pending:
+            # Generic response — don't leak whether the email is pending
+            return {"message": "If a pending registration exists, a new code has been sent."}
+
+        otp = _generate_otp()
+        now = datetime.now(UTC)
+        otp_expires_at = now + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+        pending_expires_at = now + timedelta(minutes=30)
+
+        await database.pending_users.update_one(
+            {"email": email},
+            {
+                "$set": {
+                    "otp": otp,
+                    "otp_expires_at": otp_expires_at,
+                    "expires_at": pending_expires_at,
                 }
-            verified_at = datetime.now(UTC)
-            await database.super_admins.update_one(
-                {"_id": super_admin["_id"], "status": "pending_verification"},
-                {"$set": {"status": "active", "email_verified_at": verified_at, "updated_at": verified_at}},
-            )
-            return {
-                "message": "Your email has been verified. Your super admin account is now active.",
-                "already_verified": False,
-                "role": "super_admin",
-                "redirect_to": "/login",
-            }
+            },
+        )
 
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account was not found.")
+        try:
+            email_service.send_signup_otp(email, pending.get("full_name", ""), otp)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="We could not resend the verification email. Please try again.",
+            ) from exc
+
+        return {"message": "A new verification code has been sent to your email."}
+
+    # Kept for backward compatibility — delegates to resend_otp
+    async def resend_verification(self, email: str) -> dict:
+        return await self.resend_otp(email)
+
+    # ------------------------------------------------------------------ #
+    # BOOTSTRAP SUPER ADMIN                                                #
+    # ------------------------------------------------------------------ #
 
     async def bootstrap_super_admin(self, request: BootstrapSuperAdminRequest) -> dict:
+        """Create the first super admin when none exists yet (OTP-gated)."""
         existing_count = await database.super_admins.count_documents({})
         if existing_count > 0:
             raise HTTPException(
@@ -178,129 +272,51 @@ class AuthService:
                 detail="A super admin already exists. Sign in with the Super Admin role.",
             )
 
-        try:
-            response = await run_in_threadpool(
-                supabase.auth.sign_up,
-                {
-                    "email": request.email,
-                    "password": request.password,
-                    "options": {
-                        "data": {
-                            "full_name": request.full_name,
-                            "phone": request.phone,
-                            "role": "super_admin",
-                        },
-                        "email_redirect_to": settings.verification_redirect_url,
-                    },
-                },
-            )
-        except Exception as error:
-            message = str(error).lower()
-            if "rate limit" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Email sending is temporarily rate-limited by Supabase. Wait a few minutes, then try again.",
-                ) from error
-            if "already" in message or "registered" in message or "duplicate" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="An account already exists for this email address.",
-                ) from error
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="We could not create the super admin account. Please try again.",
-            ) from error
+        email = request.email.lower().strip()
 
-        if not response.user or response.user.identities == []:
+        if await database.users.find_one({"email": email}):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An account already exists for this email address.",
             )
 
+        otp = _generate_otp()
         now = datetime.now(UTC)
-        await database.super_admins.insert_one(
+        otp_expires_at = now + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+        pending_expires_at = now + timedelta(minutes=30)
+
+        await database.pending_users.replace_one(
+            {"email": email},
             {
-                "supabase_user_id": response.user.id,
+                "email": email,
                 "full_name": request.full_name,
-                "email": request.email,
                 "phone": request.phone,
+                "password_hash": hash_password(request.password),
                 "role": "super_admin",
-                "status": "pending_verification",
-                "email_verified_at": None,
+                "otp": otp,
+                "otp_expires_at": otp_expires_at,
+                "expires_at": pending_expires_at,
                 "created_at": now,
-                "updated_at": now,
-            }
+            },
+            upsert=True,
         )
+
+        try:
+            email_service.send_signup_otp(email, request.full_name, otp)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="We could not send the verification email. Please try again.",
+            ) from exc
+
         return {
-            "message": "Super admin created. Check your inbox to verify your email, then sign in as Super Admin.",
+            "message": "Super admin registration initiated. Check your inbox for the verification code.",
             "role": "super_admin",
         }
 
-    # ------------------------------------------------------------------
-    # New methods for US-003 → US-006
-    # ------------------------------------------------------------------
-
-    async def resend_verification(self, email: str) -> dict:
-        """
-        Resend the verification email while the account is still inactive.
-        US-003: Recruiter wants to resend verification if not received.
-        Also supports candidates (US-010) without changing recruiter behavior.
-        """
-        recruiter = await database.recruiters.find_one({"email": email})
-        if recruiter:
-            if recruiter["status"] != "pending_verification":
-                return {"message": "If an account with that email exists, a new verification email has been sent."}
-
-            try:
-                await run_in_threadpool(
-                    supabase.auth.resend,
-                    {
-                        "type": "signup",
-                        "email": email,
-                        "options": {"email_redirect_to": settings.verification_redirect_url},
-                    },
-                )
-            except Exception as error:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="We could not resend the verification email. Please try again.",
-                ) from error
-
-            await self._create_audit_log(
-                recruiter["supabase_user_id"], email, "recruiter_verification_resent", "success"
-            )
-            return {"message": "A new verification email has been sent. Please check your inbox."}
-
-        candidate = await database.candidates.find_one({"email": email})
-        if not candidate or candidate["status"] != "pending_verification":
-            return {"message": "If an account with that email exists, a new verification email has been sent."}
-
-        try:
-            await run_in_threadpool(
-                supabase.auth.resend,
-                {
-                    "type": "signup",
-                    "email": email,
-                    "options": {"email_redirect_to": settings.verification_redirect_url},
-                },
-            )
-        except Exception as error:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="We could not resend the verification email. Please try again.",
-            ) from error
-
-        await database.audit_logs.insert_one(
-            {
-                "candidate_id": candidate["supabase_user_id"],
-                "email": email,
-                "module": "authentication",
-                "action": "candidate_verification_resent",
-                "outcome": "success",
-                "created_at": datetime.now(UTC),
-            }
-        )
-        return {"message": "A new verification email has been sent. Please check your inbox."}
+    # ------------------------------------------------------------------ #
+    # LOGIN                                                                #
+    # ------------------------------------------------------------------ #
 
     ROLE_REDIRECTS = {
         "recruiter": "/dashboard/recruiter",
@@ -311,36 +327,26 @@ class AuthService:
 
     async def login(self, request: LoginRequest) -> dict:
         """
-        Authenticate by selected role and route to the matching dashboard.
-        US-004: Secure login for recruiter (extended for candidate, employee, super_admin).
-        Business rule: maximum 5 failed attempts, then the account is locked for 15 minutes.
+        Authenticate with email + password, scoped to the requested role.
+        Business rule: max 5 failed attempts, 15-minute lockout.
         """
-        normalized_email = request.email.lower().strip()
-        await self._check_account_lock(normalized_email)
+        email = request.email.lower().strip()
+        await self._check_account_lock(email)
 
-        try:
-            auth_response = await run_in_threadpool(
-                supabase.auth.sign_in_with_password,
-                {"email": request.email, "password": request.password},
-            )
-        except Exception as error:
-            await self._register_failed_login(normalized_email)
+        # Verify credentials against the users collection
+        user_doc = await database.users.find_one({"email": email})
+        if not user_doc or not verify_password(request.password, user_doc.get("password_hash", "")):
+            await self._register_failed_login(email)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password.",
-            ) from error
-
-        user = auth_response.user
-        if not user or not user.email_confirmed_at:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Please verify your email before logging in.",
             )
 
-        # Credentials are valid — clear any prior failed-attempt history for this email.
-        await self._clear_failed_login(normalized_email)
+        await self._clear_failed_login(email)
+        user_id = str(user_doc["_id"])
 
-        profile = await self._resolve_role_profile(user.id, request.role)
+        # Resolve the role profile
+        profile = await self._resolve_role_profile(user_id, request.role)
         if not profile:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -353,10 +359,14 @@ class AuthService:
             if onboarding_status != "submitted":
                 redirect_to = "/onboarding"
 
+        access_token = create_access_token({"user_id": user_id, "email": email, "role": request.role})
+        refresh_token_str = create_refresh_token({"user_id": user_id, "email": email, "role": request.role})
+        await self._store_refresh_token(user_id, refresh_token_str)
+
         await database.audit_logs.insert_one(
             {
-                "user_id": user.id,
-                "email": profile["email"],
+                "user_id": user_id,
+                "email": email,
                 "module": "authentication",
                 "action": f"{request.role}_login",
                 "outcome": "success",
@@ -367,7 +377,7 @@ class AuthService:
         return {
             "message": "Login successful.",
             "user": {
-                "id": profile["supabase_user_id"],
+                "id": user_id,
                 "full_name": profile["full_name"],
                 "email": profile["email"],
                 "phone": profile.get("phone"),
@@ -376,16 +386,257 @@ class AuthService:
                 "department": profile.get("department"),
             },
             "session": {
-                "access_token": auth_response.session.access_token,
-                "refresh_token": auth_response.session.refresh_token,
-                "expires_in": auth_response.session.expires_in,
-                "token_type": auth_response.session.token_type,
+                "access_token": access_token,
+                "refresh_token": refresh_token_str,
+                "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
+                "token_type": "bearer",
             },
             "redirect_to": redirect_to,
         }
 
+    # ------------------------------------------------------------------ #
+    # LOGOUT                                                               #
+    # ------------------------------------------------------------------ #
+
+    async def logout(self, current_user: CurrentUser) -> dict:
+        """Revoke all refresh tokens for the current user."""
+        await database.refresh_tokens.delete_many({"user_id": current_user.id})
+        await database.audit_logs.insert_one(
+            {
+                "user_id": current_user.id,
+                "email": current_user.email,
+                "role": current_user.role,
+                "module": "authentication",
+                "action": f"{current_user.role}_logout",
+                "outcome": "success",
+                "created_at": datetime.now(UTC),
+            }
+        )
+        return {"message": "You have been signed out."}
+
+    # ------------------------------------------------------------------ #
+    # REFRESH TOKEN                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def refresh_token(self, refresh_token_str: str) -> dict:
+        """Exchange a valid refresh token for a new access token."""
+        stored = await database.refresh_tokens.find_one({"token": refresh_token_str})
+        if not stored:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The refresh token is invalid or has expired.",
+            )
+
+        expires_at = stored["expires_at"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if datetime.now(UTC) > expires_at:
+            await database.refresh_tokens.delete_one({"token": refresh_token_str})
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The refresh token is invalid or has expired.",
+            )
+
+        # Decode to get payload
+        try:
+            from jose import JWTError
+            payload = jwt.decode(refresh_token_str, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="The refresh token is invalid or has expired.",
+            )
+
+        user_id = payload.get("user_id")
+        email = payload.get("email")
+        role = payload.get("role")
+
+        new_access_token = create_access_token({"user_id": user_id, "email": email, "role": role})
+        new_refresh_token = create_refresh_token({"user_id": user_id, "email": email, "role": role})
+
+        # Rotate: delete old, store new
+        await database.refresh_tokens.delete_one({"token": refresh_token_str})
+        await self._store_refresh_token(user_id, new_refresh_token)
+
+        return {
+            "message": "Session refreshed.",
+            "session": {
+                "access_token": new_access_token,
+                "refresh_token": new_refresh_token,
+                "expires_in": settings.JWT_EXPIRE_MINUTES * 60,
+                "token_type": "bearer",
+            },
+        }
+
+    # ------------------------------------------------------------------ #
+    # FORGOT PASSWORD                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def forgot_password(self, email: str) -> dict:
+        """Generate a password-reset OTP and send it by email."""
+        email = email.lower().strip()
+
+        # Check if the user exists across all role collections
+        user_exists = False
+        for collection_name in ("recruiters", "candidates", "employees", "super_admins"):
+            profile = await database[collection_name].find_one({"email": email})
+            if profile and profile.get("status") == "active":
+                user_exists = True
+                await database.audit_logs.insert_one(
+                    {
+                        "user_id": profile.get("user_id"),
+                        "email": email,
+                        "role": profile.get("role"),
+                        "module": "authentication",
+                        "action": "password_reset_requested",
+                        "outcome": "requested",
+                        "created_at": datetime.now(UTC),
+                    }
+                )
+                break
+
+        # Always return a generic message — don't leak whether the email exists
+        if user_exists:
+            otp = _generate_otp()
+            now = datetime.now(UTC)
+            otp_expires_at = now + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+
+            await database.otp_verifications.replace_one(
+                {"email": email, "purpose": "reset_password"},
+                {
+                    "email": email,
+                    "purpose": "reset_password",
+                    "otp": otp,
+                    "used": False,
+                    "expires_at": otp_expires_at,
+                    "created_at": now,
+                },
+                upsert=True,
+            )
+
+            try:
+                email_service.send_forgot_password_otp(email, otp)
+            except Exception:
+                pass  # Best-effort; don't reveal failures
+
+        return {
+            "message": "If an account with that email exists, a password reset code has been sent. Check your inbox and spam folder."
+        }
+
+    # ------------------------------------------------------------------ #
+    # RESET PASSWORD                                                       #
+    # ------------------------------------------------------------------ #
+
+    async def reset_password(self, email: str, otp: str, password: str) -> dict:
+        """Verify the reset OTP and update the user's password."""
+        email = email.lower().strip()
+
+        otp_record = await database.otp_verifications.find_one(
+            {"email": email, "purpose": "reset_password"}
+        )
+        if not otp_record:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No password reset request was found. Please request a new code.",
+            )
+
+        if otp_record.get("used"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This reset code has already been used. Please request a new one.",
+            )
+
+        expires_at = otp_record["expires_at"]
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+
+        if datetime.now(UTC) > expires_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This reset code has expired. Please request a new one.",
+            )
+
+        if otp_record["otp"] != otp.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid reset code. Please try again.",
+            )
+
+        # Update the password
+        new_hash = hash_password(password)
+        result = await database.users.update_one(
+            {"email": email},
+            {"$set": {"password_hash": new_hash, "updated_at": datetime.now(UTC)}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Account not found.",
+            )
+
+        # Invalidate the OTP and all existing refresh tokens
+        await database.otp_verifications.update_one(
+            {"email": email, "purpose": "reset_password"},
+            {"$set": {"used": True}},
+        )
+        user_doc = await database.users.find_one({"email": email})
+        if user_doc:
+            await database.refresh_tokens.delete_many({"user_id": str(user_doc["_id"])})
+
+        await database.audit_logs.insert_one(
+            {
+                "email": email,
+                "module": "authentication",
+                "action": "password_reset_completed",
+                "outcome": "success",
+                "created_at": datetime.now(UTC),
+            }
+        )
+
+        return {"message": "Your password has been updated. You can now sign in."}
+
+    # ------------------------------------------------------------------ #
+    # CHANGE PASSWORD (authenticated)                                     #
+    # ------------------------------------------------------------------ #
+
+    async def change_password(self, current_user: CurrentUser, current_password: str, new_password: str) -> dict:
+        """Allow authenticated users to change their own password."""
+        user_doc = await database.users.find_one({"email": current_user.email})
+        if not user_doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found.")
+
+        if not verify_password(current_password, user_doc.get("password_hash", "")):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect.",
+            )
+
+        new_hash = hash_password(new_password)
+        await database.users.update_one(
+            {"email": current_user.email},
+            {"$set": {"password_hash": new_hash, "updated_at": datetime.now(UTC)}},
+        )
+
+        # Invalidate all refresh tokens for security
+        await database.refresh_tokens.delete_many({"user_id": current_user.id})
+
+        await database.audit_logs.insert_one(
+            {
+                "user_id": current_user.id,
+                "email": current_user.email,
+                "module": "authentication",
+                "action": "password_changed",
+                "outcome": "success",
+                "created_at": datetime.now(UTC),
+            }
+        )
+        return {"message": "Password updated successfully."}
+
+    # ------------------------------------------------------------------ #
+    # Helpers: brute-force protection                                     #
+    # ------------------------------------------------------------------ #
+
     async def _check_account_lock(self, email: str) -> None:
-        """Raise 423 Locked if this email is currently locked out from failed sign-ins."""
         record = await database.login_attempts.find_one({"email": email})
         if not record or not record.get("locked_until"):
             return
@@ -396,7 +647,6 @@ class AuthService:
 
         now = datetime.now(UTC)
         if locked_until <= now:
-            # Lock has expired — reset so the next attempt is evaluated fresh.
             await database.login_attempts.update_one(
                 {"email": email}, {"$set": {"failed_count": 0, "locked_until": None}}
             )
@@ -412,7 +662,6 @@ class AuthService:
         )
 
     async def _register_failed_login(self, email: str) -> None:
-        """Increment the failed-attempt counter and lock the account after 5 failures."""
         now = datetime.now(UTC)
         record = await database.login_attempts.find_one_and_update(
             {"email": email},
@@ -441,49 +690,15 @@ class AuthService:
                 {"email": email},
                 {"$set": {"locked_until": locked_until, "failed_count": 0}},
             )
-            await database.audit_logs.insert_one(
-                {
-                    "email": email,
-                    "module": "authentication",
-                    "action": "account_locked",
-                    "outcome": "locked",
-                    "detail": (
-                        f"Locked for {LOCKOUT_DURATION_MINUTES} minutes after "
-                        f"{LOCKOUT_THRESHOLD} consecutive failed attempts."
-                    ),
-                    "created_at": now,
-                }
-            )
 
     async def _clear_failed_login(self, email: str) -> None:
         await database.login_attempts.delete_one({"email": email})
 
-    async def logout(self, current_user: CurrentUser) -> dict:
-        """
-        US-008: Destroy the session server-side, revoke the refresh token, and audit the event.
-        Best-effort: even if the upstream revoke call fails (e.g. token already expired),
-        the caller should still be treated as signed out locally.
-        """
-        outcome = "success"
-        try:
-            await run_in_threadpool(supabase.auth.admin.sign_out, current_user.access_token, "global")
-        except Exception:
-            outcome = "token_already_invalid"
+    # ------------------------------------------------------------------ #
+    # Helpers: profile resolution & refresh tokens                        #
+    # ------------------------------------------------------------------ #
 
-        await database.audit_logs.insert_one(
-            {
-                "user_id": current_user.id,
-                "email": current_user.email,
-                "role": current_user.role,
-                "module": "authentication",
-                "action": f"{current_user.role}_logout",
-                "outcome": outcome,
-                "created_at": datetime.now(UTC),
-            }
-        )
-        return {"message": "You have been signed out."}
-
-    async def _resolve_role_profile(self, supabase_user_id: str, role: str) -> dict | None:
+    async def _resolve_role_profile(self, user_id: str, role: str) -> dict | None:
         collections = {
             "recruiter": database.recruiters,
             "candidate": database.candidates,
@@ -493,143 +708,25 @@ class AuthService:
         collection = collections.get(role)
         if collection is None:
             return None
-        profile = await collection.find_one({"supabase_user_id": supabase_user_id})
+        profile = await collection.find_one({"user_id": user_id})
         if not profile or profile.get("status") != "active":
             return None
         return profile
 
-    async def refresh_token(self, refresh_token: str) -> dict:
-        """
-        Exchange a valid refresh token for a new token pair.
-        US-005: Secure persistent session via refresh tokens.
-        """
-        try:
-            response = await run_in_threadpool(
-                supabase.auth.refresh_session,
-                refresh_token,
-            )
-        except Exception as error:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="The refresh token is invalid or has expired.",
-            ) from error
+    async def _store_refresh_token(self, user_id: str, token: str) -> None:
+        await database.refresh_tokens.insert_one(
+            {
+                "user_id": user_id,
+                "token": token,
+                "expires_at": datetime.now(UTC) + timedelta(days=7),
+                "created_at": datetime.now(UTC),
+            }
+        )
 
-        if not response.session:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not refresh the session. Please log in again.",
-            )
-
-        return {
-            "message": "Session refreshed.",
-            "session": {
-                "access_token": response.session.access_token,
-                "refresh_token": response.session.refresh_token,
-                "expires_in": response.session.expires_in,
-                "token_type": response.session.token_type,
-            },
-        }
-
-    async def forgot_password(self, email: str) -> dict:
-        """
-        Send a password-reset email via Supabase.
-        US-006: Secure password reset for any role account.
-        """
-        normalized_email = email.lower().strip()
-
-        for collection_name in ("recruiters", "candidates", "employees", "super_admins"):
-            profile = await database[collection_name].find_one({"email": normalized_email})
-            if profile and profile.get("status") == "active":
-                await database.audit_logs.insert_one(
-                    {
-                        "user_id": profile.get("supabase_user_id"),
-                        "email": normalized_email,
-                        "role": profile.get("role"),
-                        "module": "authentication",
-                        "action": "password_reset_requested",
-                        "outcome": "requested",
-                        "created_at": datetime.now(UTC),
-                    }
-                )
-                break
-
-        try:
-            await run_in_threadpool(
-                supabase.auth.reset_password_for_email,
-                normalized_email,
-                {"redirect_to": settings.password_reset_redirect_url},
-            )
-        except Exception as error:
-            message = str(error).lower()
-            await database.audit_logs.insert_one(
-                {
-                    "email": normalized_email,
-                    "module": "authentication",
-                    "action": "password_reset_failed",
-                    "outcome": "failed",
-                    "detail": str(error)[:500],
-                    "created_at": datetime.now(UTC),
-                }
-            )
-            if "rate limit" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many reset emails were requested. Please wait a few minutes and try again.",
-                ) from error
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "We could not send the password reset email. "
-                    "Confirm the email exists in Supabase Auth, that "
-                    f"{settings.password_reset_redirect_url} is allowed in Supabase Redirect URLs, "
-                    "and that Auth email/SMTP is configured."
-                ),
-            ) from error
-
-        return {
-            "message": "If an account with that email exists, a password reset link has been sent. Check your inbox and spam folder."
-        }
-
-    async def reset_password(self, access_token: str, refresh_token: str, password: str) -> dict:
-        """Complete password reset using the recovery session from the email link."""
-        try:
-            await run_in_threadpool(supabase.auth.set_session, access_token, refresh_token)
-            await run_in_threadpool(supabase.auth.update_user, {"password": password})
-        except Exception as error:
-            message = str(error).lower()
-            if "session" in message or "token" in message or "jwt" in message:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="This reset link is invalid or has expired. Request a new one.",
-                ) from error
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="We could not update your password. Please try again.",
-            ) from error
-
-        try:
-            user_response = await run_in_threadpool(supabase.auth.get_user, access_token)
-            user = user_response.user
-            if user and user.email:
-                await database.audit_logs.insert_one(
-                    {
-                        "user_id": user.id,
-                        "email": user.email,
-                        "module": "authentication",
-                        "action": "password_reset_completed",
-                        "outcome": "success",
-                        "created_at": datetime.now(UTC),
-                    }
-                )
-        except Exception:
-            pass
-
-        return {"message": "Your password has been updated. You can now sign in."}
-
-    async def _create_audit_log(self, recruiter_id: str, email: str, action: str, outcome: str) -> None:
+    async def _create_audit_log(self, user_id: str, email: str, action: str, outcome: str) -> None:
         await database.audit_logs.insert_one(
             {
-                "recruiter_id": recruiter_id,
+                "recruiter_id": user_id,
                 "email": email,
                 "module": "authentication",
                 "action": action,

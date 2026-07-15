@@ -6,8 +6,10 @@ class Settings(BaseSettings):
     DEBUG: bool
 
     SECRET_KEY: str
+    JWT_SECRET: str
     JWT_ALGORITHM: str
     ACCESS_TOKEN_EXPIRE: int
+    JWT_EXPIRE_MINUTES: int
 
     MONGODB_URI: str
     DATABASE_NAME: str
@@ -19,6 +21,20 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     REDIS_URL: str
     ALLOWED_ORIGINS: str
+
+    SMTP_HOST: str
+    SMTP_PORT: int
+    SMTP_USERNAME: str
+    SMTP_PASSWORD: str
+    SMTP_FROM_EMAIL: str
+    SMTP_FROM_NAME: str
+    MAIL_USE_TLS: bool = True
+    MAIL_USE_SSL: bool = False
+
+    FRONTEND_URL: str
+    BACKEND_URL: str
+    OTP_EXPIRE_MINUTES: int = 10
+    INVITATION_EXPIRE_HOURS: int = 48
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

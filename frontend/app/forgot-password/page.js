@@ -2,11 +2,13 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { forgotPassword, getApiErrorMessage } from "@/services/authService";
 
 export default function ForgotPasswordPage() {
+  const router = useRouter();
   const [email, setEmail] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState("");
@@ -25,6 +27,10 @@ export default function ForgotPasswordPage() {
     try {
       const data = await forgotPassword(email.trim());
       setMessage(data.message);
+      // Store email for the reset-password page to pre-fill
+      sessionStorage.setItem("resetEmail", email.trim());
+      // After a short delay, navigate to the reset password page
+      setTimeout(() => router.push("/reset-password"), 2000);
     } catch (err) {
       setError(getApiErrorMessage(err, "Something went wrong. Please try again."));
     } finally {
@@ -44,7 +50,7 @@ export default function ForgotPasswordPage() {
         <div className="auth-intro">
           <p className="eyebrow">Account recovery</p>
           <h1 id="forgot-heading">Reset your password</h1>
-          <p>Enter the email address for your Talent account. We’ll send a one-time reset link.</p>
+          <p>Enter your email address. We&apos;ll send a one-time reset code.</p>
         </div>
 
         <form className="auth-form" onSubmit={handleSubmit} noValidate>
@@ -64,7 +70,7 @@ export default function ForgotPasswordPage() {
           {message && <p className="form-message success">{message}</p>}
 
           <button className="primary-button" type="submit" disabled={isSubmitting}>
-            {isSubmitting ? "Sending link…" : "Send reset link"}
+            {isSubmitting ? "Sending code…" : "Send reset code"}
           </button>
         </form>
 
@@ -77,11 +83,11 @@ export default function ForgotPasswordPage() {
         <div>
           <p className="eyebrow">Mazik Global</p>
           <h2>Reset securely.</h2>
-          <p>We will email you a one‑time link to set a new password.</p>
+          <p>We will email you a one‑time code to set a new password. It expires in 10 minutes.</p>
         </div>
         <div className="aside-metric">
           <strong>Secure by design</strong>
-          <span>Password reset links expire after 24 hours.</span>
+          <span>OTP reset codes expire after 10 minutes.</span>
         </div>
       </aside>
     </main>
